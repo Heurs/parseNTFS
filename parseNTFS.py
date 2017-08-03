@@ -2,7 +2,6 @@ import struct
 import datetime
 import os
 import sys
-import ctypes
 
 global debug
 global rootFile
@@ -87,6 +86,143 @@ class WindowsTime:
      # However, doing the floor loses the usecs....
         return (t*1e-7 - 11644473600)
      #return((t//10000000)-11644473600)
+
+
+# Code from: https://pypi.python.org/pypi/LaZy_NT
+def process_comp_stream(to_decompress):
+        """
+        Follow a compressed data stream from the beginning of this chunk,
+        stored in the `__working_cluster`. Decompress the stream into the
+        `__decompressed_stream`, then send the data to all `CarveObject`s in
+        the 'Processing' state.
+        """
+        
+        working_cluster = to_decompress
+        decompressed_stream_all = ""
+        decompressed_stream = ""
+        abs_offset = 0
+        comp_header = working_cluster[0:2]
+        # 0x0000 header indicates the end of this compression stream
+        while not (comp_header[0] == chr(0x00) and
+                   comp_header[1] == chr(0x00)):
+            # Otherwise decode the header to determine this segment's length
+            header_decode = ((ord(comp_header[1]) << 8) +
+                             ord(comp_header[0]))
+            header_len = int((header_decode & 0x0FFF) + 1)
+            if (header_decode & 0x8000) == 0x8000:
+                header_cbit = True
+            else:
+                header_cbit = False
+            # Grab the data length indicated, plus the next two-byte header
+            # self.read_bytes(header_len + 4, seek=abs_offset)
+            
+            working_cluster = to_decompress[abs_offset:abs_offset+header_len + 4]
+            
+            # Uncompressed data in the stream can be copied directly into
+            # the decompressed stream (minus the two headers)
+            if not header_cbit:
+                decompressed_stream = "".join(
+                    [decompressed_stream, working_cluster[2:-2]])
+                # Move abs_offset, extract the next header and repeat
+                abs_offset += len(working_cluster) - 2
+                comp_header = (working_cluster[-2] +
+                                      working_cluster[-1])
+                continue
+            # Compressed data in the stream must be decompressed first
+            else:
+                rel_offset = 2 # account for the 2 byte tag we already passed
+                # For the length of this segment (until you hit the next header)
+                while rel_offset < len(working_cluster) - 2:
+                    # Extract and decode the next tag byte
+                    tag_byte = working_cluster[rel_offset]
+                    rel_offset += 1
+                    tag_byte_decode = format(ord(tag_byte), '008b')
+                    # if len(working_cluster) < 10:
+                        # break
+                    # For of the 8 bits in the tag byte
+                    for i in range(7, -1, -1):
+                        # Safely handle a 'partial' tag byte at end of segment
+                        if rel_offset >= len(working_cluster) - 2:
+                            continue
+                        # '0' bit indicates an uncompressed byte
+                        if tag_byte_decode[i] == '0':
+                            decompressed_stream = "".join(
+                                [decompressed_stream,
+                                 working_cluster[rel_offset]])
+                            rel_offset += 1
+                        # '1' bit indicates a compression tuple
+                        else:
+                            comp_tuple = ord(
+                                working_cluster[rel_offset + 1])
+                            comp_tuple = (comp_tuple << 8) + \
+                                         ord(working_cluster[rel_offset])
+                            # Tuple decoding changes based on offset within
+                            # the orignal 4K cluster (now dec_stream length)
+                            len_mask = 0x0FFF
+                            shift_amt = 12
+                            rel_cluster_offset = len(
+                                decompressed_stream) % 4096 - 1
+                            while rel_cluster_offset >= 16:
+                                rel_cluster_offset >>= 1
+                                len_mask >>= 1
+                                shift_amt -= 1
+                            # Decode the tuple into backref and length
+                            tuple_len = (comp_tuple & len_mask) + 3
+                            tuple_backref = (
+                                ((len_mask ^ 0xFFFF) & comp_tuple)
+                                >> shift_amt) + 1
+                            # Locate the backref starting offset
+                            backref_start = (len(decompressed_stream) -
+                                             tuple_backref)
+                            # Is the stream long enough to fulfill the length?
+                            if (backref_start + tuple_len <=
+                                    len(decompressed_stream)):
+                                decompressed_stream = "".join(
+                                    [decompressed_stream,
+                                     decompressed_stream[
+                                         backref_start:
+                                         backref_start + tuple_len]])
+                            # If not, we have to repeat bytes to meet length
+                            else:
+                                backref_len = (len(decompressed_stream) -
+                                               backref_start)
+                                remainder_len = tuple_len % backref_len
+                                if not remainder_len == 0:
+                                    backref_remainder = \
+                                        decompressed_stream[
+                                            backref_start:
+                                            backref_start + remainder_len]
+                                else:
+                                    backref_remainder = ""
+                                temp_stream = decompressed_stream[
+                                    backref_start:
+                                    len(decompressed_stream)] * \
+                                    (tuple_len // backref_len)
+                                decompressed_stream = "".join(
+                                    [decompressed_stream,
+                                     temp_stream, backref_remainder])
+                            rel_offset += 2
+                # Finished with this compression header
+                decompressed_stream_all += decompressed_stream
+                decompressed_stream = ""
+                # Move abs_offset, extract the next header and repeat
+                abs_offset += len(working_cluster) - 2
+                comp_header = (working_cluster[-2] +
+                                      working_cluster[-1])
+                continue
+        # Found 0x0000 header - this stream is finished.
+        rel_offset = abs_offset % 4096
+        if rel_offset == 0:
+            return decompressed_stream_all+decompressed_stream
+        # Re-align abs_offset to the next 4K cluster boundary. If this
+        # file isn't fragmented, its stream will continue there...
+        else:
+            rel_offset = 4096 - rel_offset - 1
+            abs_offset += rel_offset
+            # self.read_bytes(1, seek=abs_offset)
+            working_cluster = to_decompress[abs_offset:abs_offset+header_len + 4]
+            abs_offset += 1
+            return decompressed_stream_all+decompressed_stream
 
 def hexprint(string, no_print = False):
     result = ""
@@ -361,7 +497,11 @@ def decodeDataAttribute(s):
     if d['non_resid_flag'] == 1:
         d['vcn_start'] = struct.unpack("<Q",s[0x10:0x18])[0]
         d['vcn_end'] = struct.unpack("<Q",s[0x18:0x20])[0]
-        d['dataruns_offset'] = struct.unpack("<L",s[0x20:0x24])[0]
+        d['dataruns_offset'] = struct.unpack("<H",s[0x20:0x22])[0]
+        d['compress_unit_size'] = struct.unpack("<H",s[0x22:0x24])[0]
+        d['alloc_size'] = struct.unpack("<Q",s[0x28:0x30])[0]
+        d['real_size'] = struct.unpack("<Q",s[0x30:0x38])[0]
+        d['init_size'] = struct.unpack("<Q",s[0x38:0x40])[0]
         if d['nlen'] == 0:
             d['attrib_name'] = ''
         else:
@@ -1132,6 +1272,8 @@ def dumpFile(node, outputFile, ads = ""):
     if ads == "":
         if 'data' in fileInfos:
             dump = getDatasFromAttribute(fileInfos['data'])
+            if 'compress_unit_size' in fileInfos['data'] and fileInfos['data']['compress_unit_size'] > 0:
+                dump = process_comp_stream(dump)[:fileInfos['data']['init_size']]
             try:
                 destFile = open(outputFile,"wb")
             except:
